@@ -1,0 +1,31 @@
+#include <fstream>
+#include <string>
+#include <iostream>
+
+int detect_instruction(const std::string& filename,
+                       const std::string& target_inst)
+{
+    std::ifstream file(filename);
+    if (!file.is_open())
+        return 0;
+
+    std::string line;
+
+    while (std::getline(file, line)) {
+        size_t start = line.find('(');
+        size_t end   = line.find(')');
+
+        if (start != std::string::npos &&
+            end   != std::string::npos &&
+            end > start)
+        {
+            std::string inst =
+                line.substr(start + 1, end - start - 1);
+
+            if (inst == target_inst)
+                return 1;
+        }
+    }
+
+    return 0;
+}
