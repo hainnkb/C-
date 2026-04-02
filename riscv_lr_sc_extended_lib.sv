@@ -2,20 +2,24 @@
  * Copyright 2024
  *
  * Extended LR/SC instruction stream library for riscv-dv
- * 
- * Thêm vào riscv-dv bằng cách:
+ *
+ * Cách tích hợp:
  *   1. Copy file này vào riscv-dv/src/
  *   2. Thêm `include "riscv_lr_sc_extended_lib.sv" vào riscv_instr_pkg.sv
  *      (ngay sau dòng `include "riscv_amo_instr_lib.sv")
  *   3. Thêm các test entry vào target testlist.yaml
  *
- * Các stream classes:
- *   - riscv_lr_sc_cas_loop_stream       : CAS retry loop pattern
- *   - riscv_lr_sc_ordering_stream       : aq/rl ordering variants
- *   - riscv_sc_fail_no_reservation_stream: SC failure (double SC)
- *   - riscv_lr_sc_stress_stream         : Multiple LR/SC pairs
- *   - riscv_lr_sc_mixed_width_stream    : W + D width mixing (RV64)
- *   - riscv_lr_sc_double_lr_stream      : Double LR invalidation
+ * LƯU Ý QUAN TRỌNG VỀ CLASS HIERARCHY:
+ *
+ *   riscv_instr              <- base class, KHÔNG có member aq/rl
+ *     └── riscv_amo_instr    <- sub-class, CÓ: rand bit aq; rand bit rl;
+ *                               constraint aq_rl_c { (aq && rl) == 0; }
+ *
+ *   - get_rand_instr() trả về handle kiểu riscv_instr (base)
+ *   - LR/SC thực tế là riscv_amo_instr object
+ *   - Phải dùng $cast() để truy cập aq/rl
+ *   - Constraint mặc định: (aq && rl) == 0 => không cho phép aqrl
+ *     Muốn gen aqrl phải gọi: handle.aq_rl_c.constraint_mode(0)
  */
 
 // =============================================================================
@@ -39,13 +43,11 @@ class riscv_lr_sc_cas_loop_stream extends riscv_amo_base_instr_stream;
   endfunction
 
   virtual function void gen_amo_instr();
-    riscv_instr lr_instr, sc_instr, bne_instr;
-    riscv_instr alu_instrs[$];
+    riscv_instr        lr_handle, sc_handle, bne_instr;
     riscv_instr_name_t lr_type, sc_type;
-    riscv_reg_t last_alu_rd;
-    string loop_label;
+    riscv_reg_t        last_rd;
+    string             loop_label;
 
-    // Select LR/SC variant
     if (RV64A inside {supported_isa}) begin
       lr_type = LR_D;  sc_type = SC_D;
     end else begin
@@ -55,58 +57,57 @@ class riscv_lr_sc_cas_loop_stream extends riscv_amo_base_instr_stream;
     loop_label = $sformatf("cas_retry_%0d", $urandom_range(0, 99999));
 
     // --- LR instruction ---
-    lr_instr = riscv_instr::get_rand_instr(.include_instr({lr_type}));
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_instr,
+    lr_handle = riscv_instr::get_rand_instr(.include_instr({lr_type}));
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_handle,
       rs1 == rs1_reg[0];
       !(rd inside {rs1_reg[0], ZERO});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
-    lr_instr.label = loop_label;
-    lr_instr.has_label = 1'b1;
-    instr_list.push_back(lr_instr);
+    lr_handle.label = loop_label;
+    lr_handle.has_label = 1'b1;
+    instr_list.push_back(lr_handle);
+    last_rd = lr_handle.rd;
 
-    // --- ALU instructions between LR and SC ---
-    last_alu_rd = lr_instr.rd;
+    // --- ALU instructions between LR and SC (constrained I-set only) ---
     for (int i = 0; i < num_alu_between; i++) begin
       riscv_instr alu;
       alu = riscv_instr::get_rand_instr(
         .include_instr({ADDI, ADD, XORI, ORI, ANDI, SLLI, SRLI})
       );
       `DV_CHECK_RANDOMIZE_WITH_FATAL(alu,
-        rs1 == last_alu_rd;
+        rs1 == last_rd;
         !(rd inside {rs1_reg[0], ZERO});
         if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
         if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
       )
-      last_alu_rd = alu.rd;
+      last_rd = alu.rd;
       instr_list.push_back(alu);
     end
 
     // --- SC instruction ---
-    sc_instr = riscv_instr::get_rand_instr(.include_instr({sc_type}));
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_instr,
+    sc_handle = riscv_instr::get_rand_instr(.include_instr({sc_type}));
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_handle,
       rs1 == rs1_reg[0];
-      rs2 == last_alu_rd;
-      !(rd inside {rs1_reg[0], last_alu_rd, ZERO});
+      rs2 == last_rd;
+      !(rd inside {rs1_reg[0], last_rd, ZERO});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
-    instr_list.push_back(sc_instr);
+    instr_list.push_back(sc_handle);
 
     // --- BNE retry branch ---
     bne_instr = riscv_instr::get_rand_instr(.include_instr({BNE}));
     `DV_CHECK_RANDOMIZE_WITH_FATAL(bne_instr,
-      rs1 == sc_instr.rd;
+      rs1 == sc_handle.rd;
       rs2 == ZERO;
     )
     bne_instr.imm_str = loop_label;
     instr_list.push_back(bne_instr);
   endfunction
 
-  // Override: no additional mixed instructions for CAS loop
+  // CAS loop tự quản lý instruction sequence, không cần mixed
   virtual function void add_mixed_instr(int instr_cnt);
-    // Intentionally empty — CAS loop manages its own instruction sequence
   endfunction
 
 endclass : riscv_lr_sc_cas_loop_stream
@@ -114,6 +115,9 @@ endclass : riscv_lr_sc_cas_loop_stream
 
 // =============================================================================
 // STREAM 2: LR/SC with ordering bit variants (aq, rl, aqrl)
+//
+// Dùng $cast(riscv_amo_instr, handle) để truy cập aq/rl
+// Dùng constraint_mode(0) trên aq_rl_c để cho phép aqrl
 // =============================================================================
 class riscv_lr_sc_ordering_stream extends riscv_amo_base_instr_stream;
 
@@ -122,10 +126,14 @@ class riscv_lr_sc_ordering_stream extends riscv_amo_base_instr_stream;
   rand bit sc_aq;
   rand bit sc_rl;
 
-  // Spec: don't set rl on LR without aq; don't set aq on SC without rl
+  // Spec §13.2:
+  //   "Software should not set the rl bit on an LR instruction unless
+  //    the aq bit is also set"
+  //   "nor should software set the aq bit on an SC instruction unless
+  //    the rl bit is also set"
   constraint ordering_c {
-    lr_rl -> lr_aq;
-    sc_aq -> sc_rl;
+    lr_rl -> lr_aq;    // lr có rl => phải có aq  (cho phép: 00, 10, 11)
+    sc_aq -> sc_rl;    // sc có aq => phải có rl  (cho phép: 00, 01, 11)
   }
 
   constraint legal_c {
@@ -140,7 +148,8 @@ class riscv_lr_sc_ordering_stream extends riscv_amo_base_instr_stream;
   endfunction
 
   virtual function void gen_amo_instr();
-    riscv_instr lr_instr, sc_instr;
+    riscv_instr       lr_handle, sc_handle;
+    riscv_amo_instr   lr_amo, sc_amo;
     riscv_instr_name_t lr_type, sc_type;
 
     if (RV64A inside {supported_isa}) begin
@@ -149,34 +158,54 @@ class riscv_lr_sc_ordering_stream extends riscv_amo_base_instr_stream;
       lr_type = LR_W;  sc_type = SC_W;
     end
 
-    lr_instr = riscv_instr::get_rand_instr(.include_instr({lr_type}));
-    sc_instr = riscv_instr::get_rand_instr(.include_instr({sc_type}));
+    // === LR instruction ===
+    lr_handle = riscv_instr::get_rand_instr(.include_instr({lr_type}));
 
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_instr,
+    // CRITICAL: $cast từ base riscv_instr sang riscv_amo_instr
+    if (!$cast(lr_amo, lr_handle)) begin
+      `uvm_fatal(`gfn, "Failed to cast LR instruction to riscv_amo_instr")
+    end
+
+    // Nếu cần aqrl (aq=1 VÀ rl=1), phải tắt constraint mặc định
+    // riscv_amo_instr::aq_rl_c constraint { (aq && rl) == 0 }
+    if (lr_aq && lr_rl) begin
+      lr_amo.aq_rl_c.constraint_mode(0);
+    end
+
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_amo,
       rs1 == rs1_reg[0];
       !(rd inside {rs1_reg[0], ZERO});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
+      aq == lr_aq;
+      rl == lr_rl;
     )
 
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_instr,
+    // === SC instruction ===
+    sc_handle = riscv_instr::get_rand_instr(.include_instr({sc_type}));
+
+    if (!$cast(sc_amo, sc_handle)) begin
+      `uvm_fatal(`gfn, "Failed to cast SC instruction to riscv_amo_instr")
+    end
+
+    if (sc_aq && sc_rl) begin
+      sc_amo.aq_rl_c.constraint_mode(0);
+    end
+
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_amo,
       rs1 == rs1_reg[0];
-      !(rd inside {rs1_reg[0], ZERO, lr_instr.rd});
+      !(rd inside {rs1_reg[0], ZERO, lr_amo.rd});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
+      aq == sc_aq;
+      rl == sc_rl;
     )
 
-    // Apply ordering bits
-    lr_instr.aq = lr_aq;
-    lr_instr.rl = lr_rl;
-    sc_instr.aq = sc_aq;
-    sc_instr.rl = sc_rl;
-
-    instr_list.push_back(lr_instr);
-    instr_list.push_back(sc_instr);
+    instr_list.push_back(lr_amo);
+    instr_list.push_back(sc_amo);
   endfunction
 
-  // Constrained I-only instructions between LR/SC
+  // Constrained I-only instructions between LR/SC (per spec §13.3)
   virtual function void add_mixed_instr(int instr_cnt);
     riscv_instr instr;
     int i;
@@ -196,7 +225,9 @@ endclass : riscv_lr_sc_ordering_stream
 
 // =============================================================================
 // STREAM 3: SC failure — double SC (second SC must fail per spec)
-// Generates: LR(addr) -> SC(addr) [success] -> SC(addr) [must fail]
+// Spec §13.2: "An SC must fail if there is another SC (to any address)
+//              between the LR and itself in program order."
+// Generates: LR(addr) -> SC(addr) [may succeed] -> SC(addr) [MUST fail]
 // =============================================================================
 class riscv_sc_fail_no_reservation_stream extends riscv_amo_base_instr_stream;
 
@@ -212,7 +243,7 @@ class riscv_sc_fail_no_reservation_stream extends riscv_amo_base_instr_stream;
   endfunction
 
   virtual function void gen_amo_instr();
-    riscv_instr lr_instr, sc_instr_1, sc_instr_2;
+    riscv_instr        lr_handle, sc_handle_1, sc_handle_2;
     riscv_instr_name_t lr_type, sc_type;
 
     if (RV64A inside {supported_isa}) begin
@@ -221,34 +252,36 @@ class riscv_sc_fail_no_reservation_stream extends riscv_amo_base_instr_stream;
       lr_type = LR_W;  sc_type = SC_W;
     end
 
-    lr_instr = riscv_instr::get_rand_instr(.include_instr({lr_type}));
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_instr,
+    // LR
+    lr_handle = riscv_instr::get_rand_instr(.include_instr({lr_type}));
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_handle,
       rs1 == rs1_reg[0];
       !(rd inside {rs1_reg[0], ZERO});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
 
-    sc_instr_1 = riscv_instr::get_rand_instr(.include_instr({sc_type}));
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_instr_1,
+    // SC #1 — consumes & invalidates reservation
+    sc_handle_1 = riscv_instr::get_rand_instr(.include_instr({sc_type}));
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_handle_1,
       rs1 == rs1_reg[0];
-      !(rd inside {rs1_reg[0], ZERO, lr_instr.rd});
+      !(rd inside {rs1_reg[0], ZERO, lr_handle.rd});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
 
-    // Second SC — must fail (reservation invalidated by first SC)
-    sc_instr_2 = riscv_instr::get_rand_instr(.include_instr({sc_type}));
-    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_instr_2,
+    // SC #2 — MUST FAIL
+    sc_handle_2 = riscv_instr::get_rand_instr(.include_instr({sc_type}));
+    `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_handle_2,
       rs1 == rs1_reg[0];
-      !(rd inside {rs1_reg[0], ZERO, lr_instr.rd, sc_instr_1.rd});
+      !(rd inside {rs1_reg[0], ZERO, lr_handle.rd, sc_handle_1.rd});
       if (reserved_rd.size() > 0) { !(rd inside {reserved_rd}); }
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
 
-    instr_list.push_back(lr_instr);
-    instr_list.push_back(sc_instr_1);
-    instr_list.push_back(sc_instr_2);
+    instr_list.push_back(lr_handle);
+    instr_list.push_back(sc_handle_1);
+    instr_list.push_back(sc_handle_2);
   endfunction
 
 endclass : riscv_sc_fail_no_reservation_stream
@@ -419,7 +452,8 @@ endclass : riscv_lr_sc_mixed_width_stream
 
 // =============================================================================
 // STREAM 6: Double LR — second LR invalidates first reservation
-// Generates: LR(addr_0) -> LR(addr_1) -> SC(addr_0) [must fail]
+// Spec §13.2: "a hart can only hold one reservation at a time"
+// Generates: LR(addr_0) -> LR(addr_1) -> SC(addr_0) [MUST fail]
 // =============================================================================
 class riscv_lr_sc_double_lr_stream extends riscv_amo_base_instr_stream;
 
@@ -439,7 +473,7 @@ class riscv_lr_sc_double_lr_stream extends riscv_amo_base_instr_stream;
   endfunction
 
   virtual function void gen_amo_instr();
-    riscv_instr lr_1, lr_2, sc_1;
+    riscv_instr        lr_1, lr_2, sc_1;
     riscv_instr_name_t lr_type, sc_type;
 
     if (RV64A inside {supported_isa}) begin
@@ -448,7 +482,7 @@ class riscv_lr_sc_double_lr_stream extends riscv_amo_base_instr_stream;
       lr_type = LR_W;  sc_type = SC_W;
     end
 
-    // LR #1 on addr_0
+    // LR #1 on addr_0 — sets reservation
     lr_1 = riscv_instr::get_rand_instr(.include_instr({lr_type}));
     `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_1,
       rs1 == rs1_reg[0];
@@ -457,7 +491,7 @@ class riscv_lr_sc_double_lr_stream extends riscv_amo_base_instr_stream;
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
 
-    // LR #2 on addr_1 — invalidates reservation on addr_0
+    // LR #2 on addr_1 — overwrites reservation
     lr_2 = riscv_instr::get_rand_instr(.include_instr({lr_type}));
     `DV_CHECK_RANDOMIZE_WITH_FATAL(lr_2,
       rs1 == rs1_reg[1];
@@ -466,7 +500,7 @@ class riscv_lr_sc_double_lr_stream extends riscv_amo_base_instr_stream;
       if (cfg.reserved_regs.size() > 0) { !(rd inside {cfg.reserved_regs}); }
     )
 
-    // SC on addr_0 — MUST FAIL (reservation moved to addr_1)
+    // SC on addr_0 — MUST FAIL (reservation now on addr_1)
     sc_1 = riscv_instr::get_rand_instr(.include_instr({sc_type}));
     `DV_CHECK_RANDOMIZE_WITH_FATAL(sc_1,
       rs1 == rs1_reg[0];
